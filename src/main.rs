@@ -495,6 +495,8 @@ async fn main() -> Result<()> {
         }
     )]);
 
+    info!("connected. starting event stream...");
+
     let mut stream = client
         .inner_mut_ref()
         .stream_events(StreamEventsRequest { commands })
