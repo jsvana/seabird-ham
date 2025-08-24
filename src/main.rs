@@ -20,6 +20,7 @@ use std::env;
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
+use tracing::info;
 
 #[derive(Debug, Deserialize)]
 struct BandData {
@@ -470,8 +471,10 @@ async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSour
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt().init();
+
     let url = env::var("SEABIRD_URL").unwrap_or_else(|_| "https://api.seabird.chat".to_string());
-    println!("connecting with URL {}", url);
+    info!("connecting with URL {}", url);
 
     let token = env::var("SEABIRD_TOKEN")?;
     let mut client = Client::new(ClientConfig { url, token }).await?;
@@ -506,6 +509,8 @@ async fn main() -> Result<()> {
         })) = event.inner
         {
             if command == "bands" {
+                info!("[cmd:bands] {}", arg);
+
                 let output = format_solar_data(fetch_solar_data().await?)?;
                 client
                     .send_message(
@@ -530,6 +535,7 @@ async fn main() -> Result<()> {
                         .await?;
                 }
             } else if command == "pota" {
+                info!("[cmd:pota] {}", arg);
                 handle_pota(&mut client, &arg, command_source).await?;
             }
         }
