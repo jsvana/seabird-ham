@@ -573,7 +573,7 @@ async fn main() -> Result<()> {
     let mut client = Client::new(ClientConfig { url, token }).await?;
 
     let commands = HashMap::from_iter([
-        /*(
+        (
             "bands".to_string(),
             CommandMetadata {
                 name: "bands".to_string(),
@@ -587,7 +587,7 @@ async fn main() -> Result<()> {
                 short_help: "find most recent POTA activation".to_string(),
                 full_help: "find the most recent Parks on the Air activation. Usage: pota <band> [mode]. Default mode is SSB.".to_string(),
             }
-        )*/
+        ),
         (
             "qrz".to_string(),
             CommandMetadata {
