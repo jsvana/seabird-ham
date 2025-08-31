@@ -7,6 +7,8 @@ use chrono::TimeDelta;
 use chrono::TimeZone;
 use chrono::Utc;
 use futures::StreamExt;
+use qrz_xml::QrzXmlError;
+use qrz_xml::{ApiVersion, QrzXmlClient};
 use seabird::Client;
 use seabird::ClientConfig;
 use seabird::proto::ChannelSource;
@@ -48,18 +50,10 @@ struct Solar {
     solardata: SolarData,
 }
 
+#[derive(Default)]
 struct PossibleBandCondition {
     day: Option<String>,
     night: Option<String>,
-}
-
-impl Default for PossibleBandCondition {
-    fn default() -> Self {
-        Self {
-            day: None,
-            night: None,
-        }
-    }
 }
 
 struct BandCondition {
@@ -83,7 +77,7 @@ fn format_solar_data(data: Solar) -> Result<Vec<String>> {
     for band_data in data.solardata.calculatedconditions.band {
         let condition = possible_bands
             .entry(band_data.name.clone())
-            .or_insert_with(|| PossibleBandCondition::default());
+            .or_insert_with(PossibleBandCondition::default);
         match band_data.time.as_str() {
             "day" => {
                 if condition.day.is_some() {
@@ -336,7 +330,7 @@ fn with_reply(command_source: &ChannelSource, message: String) -> String {
             .user
             .as_ref()
             .map(|u| format!("{}: ", u.display_name))
-            .unwrap_or_else(|| "".to_string()),
+            .unwrap_or_default(),
         message
     )
 }
@@ -433,13 +427,7 @@ async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSour
                     client
                         .send_message(
                             command_source.channel_id.clone(),
-                            format!(
-                                "{}invalid mode",
-                                command_source
-                                    .user
-                                    .map(|u| format!("{}: ", u.display_name))
-                                    .unwrap_or_else(|| "".to_string())
-                            ),
+                            with_reply(&command_source, "invalid mode".to_string()),
                             /* tags = */ None,
                         )
                         .await?;
@@ -453,12 +441,9 @@ async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSour
             client
                 .send_message(
                     command_source.channel_id.clone(),
-                    format!(
-                        "{}invalid pota command. Usage: pota <band> [mode]",
-                        command_source
-                            .user
-                            .map(|u| format!("{}: ", u.display_name))
-                            .unwrap_or_else(|| "".to_string())
+                    with_reply(
+                        &command_source,
+                        "invalid pota command. Usage: pota <band> [mode]".to_string(),
                     ),
                     /* tags = */ None,
                 )
@@ -469,9 +454,117 @@ async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSour
     Ok(())
 }
 
+async fn handle_qrz(client: &mut Client, arg: &str, command_source: ChannelSource) -> Result<()> {
+    let callsign = arg;
+    if callsign.contains(' ') {
+        client
+            .send_message(
+                command_source.channel_id.clone(),
+                with_reply(&command_source, "usage: qrz <callsign>".to_string()),
+                /* tags = */ None,
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let qrz_client = QrzXmlClient::new(
+        env::var("QRZ_USERNAME")?,
+        env::var("QRZ_PASSWORD")?,
+        ApiVersion::Current,
+    )?;
+
+    let callsign_info = match qrz_client.lookup_callsign(callsign).await {
+        Ok(info) => info,
+        Err(QrzXmlError::CallsignNotFound { .. }) => {
+            client
+                .send_message(
+                    command_source.channel_id.clone(),
+                    with_reply(&command_source, format!("\"{callsign}\" not found")),
+                    /* tags = */ None,
+                )
+                .await?;
+            return Ok(());
+        }
+        Err(QrzXmlError::SubscriptionRequired) => {
+            client
+                .send_message(
+                    command_source.channel_id.clone(),
+                    with_reply(
+                        &command_source,
+                        "QRZ subscription is required but the plugin doesn't have it".to_string(),
+                    ),
+                    /* tags = */ None,
+                )
+                .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            client
+                .send_message(
+                    command_source.channel_id.clone(),
+                    with_reply(
+                        &command_source,
+                        format!("error querying QRZ for callsign \"{callsign}\": {e:?}"),
+                    ),
+                    /* tags = */ None,
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let mut reply = format!("{} is ", callsign.to_uppercase());
+    match (callsign_info.full_name(), &callsign_info.nickname) {
+        (Some(name), Some(nickname)) => {
+            reply += &format!("{name} ({nickname})");
+        }
+        (Some(name), None) => {
+            reply += &name;
+        }
+        (None, Some(nickname)) => {
+            reply += &format!("({nickname})");
+        }
+        _ => {}
+    }
+
+    reply += " - ";
+
+    if let Some(class) = &callsign_info.class {
+        reply += &format!("class {class} ");
+    }
+
+    match (&callsign_info.country, &callsign_info.grid) {
+        (Some(country), Some(grid)) => {
+            reply += &format!("[country:{country}, grid:{grid}]");
+        }
+        (Some(country), None) => {
+            reply += &format!("[country:{country}]");
+        }
+        (None, Some(grid)) => {
+            reply += &format!("[grid:{grid}]");
+        }
+        _ => {}
+    }
+
+    client
+        .send_message(
+            command_source.channel_id.clone(),
+            with_reply(&command_source, reply),
+            /* tags = */ None,
+        )
+        .await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
+
+    env::var("QRZ_USERNAME")
+        .map_err(|_| anyhow!("must specify QRZ_USERNAME environment variable"))?;
+    env::var("QRZ_PASSWORD")
+        .map_err(|_| anyhow!("must specify QRZ_PASSWORD environment variable"))?;
 
     let url = env::var("SEABIRD_URL").unwrap_or_else(|_| "https://api.seabird.chat".to_string());
     info!("connecting with URL {}", url);
@@ -479,21 +572,31 @@ async fn main() -> Result<()> {
     let token = env::var("SEABIRD_TOKEN")?;
     let mut client = Client::new(ClientConfig { url, token }).await?;
 
-    let commands = HashMap::from_iter([(
-        "bands".to_string(),
-        CommandMetadata {
-            name: "bands".to_string(),
-            short_help: "show HAM RF band conditions".to_string(),
-            full_help: "show HAM RF band conditions".to_string(),
-        },
-    ), (
-        "pota".to_string(),
-        CommandMetadata {
-            name: "pota".to_string(),
-            short_help: "find most recent POTA activation".to_string(),
-            full_help: "find the most recent Parks on the Air activation. Usage: pota <band> [mode]. Default mode is SSB.".to_string(),
-        }
-    )]);
+    let commands = HashMap::from_iter([
+        /*(
+            "bands".to_string(),
+            CommandMetadata {
+                name: "bands".to_string(),
+                short_help: "show HAM RF band conditions".to_string(),
+                full_help: "show HAM RF band conditions".to_string(),
+            },
+        ), (
+            "pota".to_string(),
+            CommandMetadata {
+                name: "pota".to_string(),
+                short_help: "find most recent POTA activation".to_string(),
+                full_help: "find the most recent Parks on the Air activation. Usage: pota <band> [mode]. Default mode is SSB.".to_string(),
+            }
+        )*/
+        (
+            "qrz".to_string(),
+            CommandMetadata {
+                name: "qrz".to_string(),
+                short_help: "HAM radio callsign lookup".to_string(),
+                full_help: "Lookup a HAM radio callsign using QRZ's API".to_string(),
+            },
+        ),
+    ]);
 
     info!("connected. starting event stream...");
 
@@ -539,6 +642,9 @@ async fn main() -> Result<()> {
             } else if command == "pota" {
                 info!("[cmd:pota] {}", arg);
                 handle_pota(&mut client, &arg, command_source).await?;
+            } else if command == "qrz" {
+                info!("[cmd:qrz] {}", arg);
+                handle_qrz(&mut client, &arg, command_source).await?;
             }
         }
     }
