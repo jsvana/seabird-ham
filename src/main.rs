@@ -22,7 +22,9 @@ use std::env;
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::str::FromStr;
-use tracing::info;
+use std::time::Duration;
+use tokio::time::timeout;
+use tracing::{error, info, warn};
 
 #[derive(Debug, Deserialize)]
 struct BandData {
@@ -123,10 +125,14 @@ fn format_solar_data(data: Solar) -> Result<Vec<String>> {
 }
 
 async fn fetch_solar_data() -> Result<Solar> {
-    let text = reqwest::get("https://www.hamqsl.com/solarxml.php")
-        .await?
-        .text()
-        .await?;
+    let text = timeout(Duration::from_secs(10), async {
+        reqwest::get("https://www.hamqsl.com/solarxml.php")
+            .await?
+            .text()
+            .await
+    })
+    .await
+    .map_err(|_| anyhow!("timeout fetching solar data"))??;
 
     Ok(serde_xml_rs::from_str(&text)?)
 }
@@ -314,10 +320,16 @@ impl Band {
 }
 
 async fn fetch_activations() -> Result<Vec<Activation>> {
-    reqwest::get("https://api.pota.app/v1/spots")
-        .await?
-        .json::<Vec<ParsedActivation>>()
-        .await?
+    let activations = timeout(Duration::from_secs(10), async {
+        reqwest::get("https://api.pota.app/v1/spots")
+            .await?
+            .json::<Vec<ParsedActivation>>()
+            .await
+    })
+    .await
+    .map_err(|_| anyhow!("timeout fetching POTA activations"))??;
+
+    activations
         .into_iter()
         .map(|a| a.try_into_activation())
         .collect::<Result<Vec<Activation>>>()
@@ -473,44 +485,62 @@ async fn handle_qrz(client: &mut Client, arg: &str, command_source: ChannelSourc
         ApiVersion::Current,
     )?;
 
-    let callsign_info = match qrz_client.lookup_callsign(callsign).await {
-        Ok(info) => info,
-        Err(QrzXmlError::CallsignNotFound { .. }) => {
+    let callsign_info = match timeout(
+        Duration::from_secs(10),
+        qrz_client.lookup_callsign(callsign),
+    )
+    .await
+    {
+        Err(_) => {
             client
                 .send_message(
                     command_source.channel_id.clone(),
-                    with_reply(&command_source, format!("\"{callsign}\" not found")),
+                    with_reply(&command_source, "QRZ lookup timed out".to_string()),
                     /* tags = */ None,
                 )
                 .await?;
             return Ok(());
         }
-        Err(QrzXmlError::SubscriptionRequired) => {
-            client
-                .send_message(
-                    command_source.channel_id.clone(),
-                    with_reply(
-                        &command_source,
-                        "QRZ subscription is required but the plugin doesn't have it".to_string(),
-                    ),
-                    /* tags = */ None,
-                )
-                .await?;
-            return Ok(());
-        }
-        Err(e) => {
-            client
-                .send_message(
-                    command_source.channel_id.clone(),
-                    with_reply(
-                        &command_source,
-                        format!("error querying QRZ for callsign \"{callsign}\": {e:?}"),
-                    ),
-                    /* tags = */ None,
-                )
-                .await?;
-            return Ok(());
-        }
+        Ok(result) => match result {
+            Ok(info) => info,
+            Err(QrzXmlError::CallsignNotFound { .. }) => {
+                client
+                    .send_message(
+                        command_source.channel_id.clone(),
+                        with_reply(&command_source, format!("\"{callsign}\" not found")),
+                        /* tags = */ None,
+                    )
+                    .await?;
+                return Ok(());
+            }
+            Err(QrzXmlError::SubscriptionRequired) => {
+                client
+                    .send_message(
+                        command_source.channel_id.clone(),
+                        with_reply(
+                            &command_source,
+                            "QRZ subscription is required but the plugin doesn't have it"
+                                .to_string(),
+                        ),
+                        /* tags = */ None,
+                    )
+                    .await?;
+                return Ok(());
+            }
+            Err(e) => {
+                client
+                    .send_message(
+                        command_source.channel_id.clone(),
+                        with_reply(
+                            &command_source,
+                            format!("error querying QRZ for callsign \"{callsign}\": {e:?}"),
+                        ),
+                        /* tags = */ None,
+                    )
+                    .await?;
+                return Ok(());
+            }
+        },
     };
 
     let mut reply = format!("{} is ", callsign.to_uppercase());
@@ -567,10 +597,7 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow!("must specify QRZ_PASSWORD environment variable"))?;
 
     let url = env::var("SEABIRD_URL").unwrap_or_else(|_| "https://api.seabird.chat".to_string());
-    info!("connecting with URL {}", url);
-
     let token = env::var("SEABIRD_TOKEN")?;
-    let mut client = Client::new(ClientConfig { url, token }).await?;
 
     let commands = HashMap::from_iter([
         (
@@ -598,54 +625,134 @@ async fn main() -> Result<()> {
         ),
     ]);
 
-    info!("connected. starting event stream...");
+    // Reconnection loop with exponential backoff
+    let mut reconnect_delay = Duration::from_secs(1);
+    let max_reconnect_delay = Duration::from_secs(60);
 
-    let mut stream = client
-        .inner_mut_ref()
-        .stream_events(StreamEventsRequest { commands })
-        .await?
-        .into_inner();
+    loop {
+        info!("connecting with URL {}", url);
 
-    while let Some(event) = stream.next().await.transpose()? {
-        if let Some(seabird::proto::event::Inner::Command(CommandEvent {
-            source: Some(command_source),
-            command,
-            arg,
-        })) = event.inner
+        let mut client = match Client::new(ClientConfig {
+            url: url.clone(),
+            token: token.clone(),
+        })
+        .await
         {
-            if command == "bands" {
-                info!("[cmd:bands] {}", arg);
+            Ok(client) => client,
+            Err(e) => {
+                error!("failed to connect: {}", e);
+                warn!("reconnecting in {:?}...", reconnect_delay);
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = std::cmp::min(reconnect_delay * 2, max_reconnect_delay);
+                continue;
+            }
+        };
 
-                let output = format_solar_data(fetch_solar_data().await?)?;
+        // Reset reconnect delay on successful connection
+        reconnect_delay = Duration::from_secs(1);
+
+        info!("connected. starting event stream...");
+
+        let mut stream = match client
+            .inner_mut_ref()
+            .stream_events(StreamEventsRequest {
+                commands: commands.clone(),
+            })
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(e) => {
+                error!("failed to start event stream: {}", e);
+                warn!("reconnecting in {:?}...", reconnect_delay);
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = std::cmp::min(reconnect_delay * 2, max_reconnect_delay);
+                continue;
+            }
+        };
+
+        // Event processing loop with timeout to detect broken streams
+        let stream_result = loop {
+            // Use a 2-minute timeout for each event. If no events arrive in 2 minutes,
+            // the stream is likely broken and we should reconnect.
+            let event_result = timeout(Duration::from_secs(120), stream.next()).await;
+
+            match event_result {
+                Err(_) => {
+                    // Timeout - stream appears to be stuck
+                    error!(
+                        "event stream timeout (no events for 120 seconds) - stream likely broken"
+                    );
+                    break Err(anyhow!("stream timeout"));
+                }
+                Ok(None) => {
+                    // Stream ended normally
+                    warn!("event stream ended");
+                    break Ok(());
+                }
+                Ok(Some(Err(e))) => {
+                    // Stream error
+                    error!("event stream error: {}", e);
+                    break Err(e.into());
+                }
+                Ok(Some(Ok(event))) => {
+                    // Process the event
+                    if let Err(e) = process_event(&mut client, event).await {
+                        error!("error processing event: {}", e);
+                        // Continue processing other events despite errors
+                    }
+                }
+            }
+        };
+
+        match stream_result {
+            Ok(()) => {
+                warn!("stream ended normally, reconnecting...");
+            }
+            Err(e) => {
+                error!("stream failed: {}, reconnecting...", e);
+            }
+        }
+
+        warn!("reconnecting in {:?}...", reconnect_delay);
+        tokio::time::sleep(reconnect_delay).await;
+        reconnect_delay = std::cmp::min(reconnect_delay * 2, max_reconnect_delay);
+    }
+}
+
+async fn process_event(client: &mut Client, event: seabird::proto::Event) -> Result<()> {
+    if let Some(seabird::proto::event::Inner::Command(CommandEvent {
+        source: Some(command_source),
+        command,
+        arg,
+    })) = event.inner
+    {
+        if command == "bands" {
+            info!("[cmd:bands] {}", arg);
+
+            let output = format_solar_data(fetch_solar_data().await?)?;
+            client
+                .send_message(
+                    command_source.channel_id.clone(),
+                    with_reply(&command_source, format!("current band conditions:")),
+                    /* tags = */ None,
+                )
+                .await?;
+
+            for line in output {
                 client
                     .send_message(
                         command_source.channel_id.clone(),
-                        match command_source.user {
-                            Some(user) => {
-                                format!("{}: current band conditions:", user.display_name)
-                            }
-                            None => "current band conditions:".to_string(),
-                        },
+                        line,
                         /* tags = */ None,
                     )
                     .await?;
-
-                for line in output {
-                    client
-                        .send_message(
-                            command_source.channel_id.clone(),
-                            line,
-                            /* tags = */ None,
-                        )
-                        .await?;
-                }
-            } else if command == "pota" {
-                info!("[cmd:pota] {}", arg);
-                handle_pota(&mut client, &arg, command_source).await?;
-            } else if command == "qrz" {
-                info!("[cmd:qrz] {}", arg);
-                handle_qrz(&mut client, &arg, command_source).await?;
             }
+        } else if command == "pota" {
+            info!("[cmd:pota] {}", arg);
+            handle_pota(client, &arg, command_source).await?;
+        } else if command == "qrz" {
+            info!("[cmd:qrz] {}", arg);
+            handle_qrz(client, &arg, command_source).await?;
         }
     }
 
