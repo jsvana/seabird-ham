@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-gnu/release/seabird-ham
+
+      - name: Create tarball
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          tar -czf seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz seabird-ham
+          mv seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz ../../../
+
+      - name: Generate checksums
+        run: |
+          sha256sum seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz > seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz.sha256
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz
+            seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz.sha256
+          body: |
+            ## seabird-ham ${{ github.ref_name }}
+
+            ### Changes in this release
+            - Added timeout detection for broken gRPC event streams (120s timeout)
+            - Added automatic reconnection with exponential backoff (1s → 60s max)
+            - Added 10-second timeouts to all external API calls (hamqsl.com, pota.app, QRZ)
+            - Enhanced logging for connection issues and stream timeouts
+            - Improved fail-fast behavior to work with systemd auto-restart
+
+            ### Installation
+
+            Download the tarball for your platform:
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz
+            ```
+
+            Verify the checksum:
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz.sha256
+            sha256sum -c seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz.sha256
+            ```
+
+            Extract and install:
+            ```bash
+            tar -xzf seabird-ham-${{ github.ref_name }}-x86_64-linux.tar.gz
+            sudo mv seabird-ham /usr/local/bin/
+            ```
+
+            ### Requirements
+            - x86_64 Linux system
+            - Environment variables: `SEABIRD_TOKEN`, `QRZ_USERNAME`, `QRZ_PASSWORD`
+            - Optional: `SEABIRD_URL` (defaults to https://api.seabird.chat)
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
