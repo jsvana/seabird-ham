@@ -9,12 +9,13 @@ use chrono::Utc;
 use futures::StreamExt;
 use qrz_xml::QrzXmlError;
 use qrz_xml::{ApiVersion, QrzXmlClient};
-use seabird::Client;
+use seabird::SeabirdClient;
 use seabird::ClientConfig;
 use seabird::proto::ChannelSource;
 use seabird::proto::CommandEvent;
 use seabird::proto::CommandMetadata;
 use seabird::proto::StreamEventsRequest;
+use seabird::proto::{Block, block::Inner as BlockInner, TextBlock, ContainerBlock};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -335,16 +336,31 @@ async fn fetch_activations() -> Result<Vec<Activation>> {
         .collect::<Result<Vec<Activation>>>()
 }
 
-fn with_reply(command_source: &ChannelSource, message: String) -> String {
-    format!(
-        "{}{}",
-        command_source
-            .user
-            .as_ref()
-            .map(|u| format!("{}: ", u.display_name))
-            .unwrap_or_default(),
-        message
-    )
+fn text_block(text: impl Into<String>) -> Block {
+    let text = text.into();
+    Block {
+        plain: text.clone(),
+        inner: Some(BlockInner::Text(TextBlock { text })),
+    }
+}
+
+fn container_block(blocks: Vec<Block>) -> Block {
+    let plain = blocks.iter().map(|b| b.plain.as_str()).collect::<String>();
+    Block {
+        plain,
+        inner: Some(BlockInner::Container(ContainerBlock { inner: blocks })),
+    }
+}
+
+fn with_reply_block(command_source: &ChannelSource, message: impl Into<String>) -> Block {
+    let message = message.into();
+    match command_source.user.as_ref() {
+        Some(user) => {
+            let prefix = format!("{}: ", user.display_name);
+            container_block(vec![text_block(prefix), text_block(message)])
+        }
+        None => text_block(message),
+    }
 }
 
 async fn most_recent_activation(band: &Band, mode: &Mode) -> Result<Option<Activation>> {
@@ -359,7 +375,7 @@ async fn most_recent_activation(band: &Band, mode: &Mode) -> Result<Option<Activ
 }
 
 async fn handle_pota_impl(
-    client: &mut Client,
+    client: &mut SeabirdClient,
     band_str: &str,
     mode: Mode,
     command_source: ChannelSource,
@@ -370,7 +386,7 @@ async fn handle_pota_impl(
             client
                 .send_message(
                     command_source.channel_id.clone(),
-                    with_reply(&command_source, "invalid_band".to_string()),
+                    with_reply_block(&command_source, "invalid_band".to_string()),
                     /* tags = */ None,
                 )
                 .await?;
@@ -392,7 +408,7 @@ async fn handle_pota_impl(
             client
                 .send_message(
                     command_source.channel_id.clone(),
-                    with_reply(
+                    with_reply_block(
                         &command_source,
                         format!(
                             "[time:{},age:{}] {}MHz {}, {} - {} ({})",
@@ -413,7 +429,7 @@ async fn handle_pota_impl(
             client
                 .send_message(
                     command_source.channel_id.clone(),
-                    with_reply(
+                    with_reply_block(
                         &command_source,
                         format!("no activations found on {} over SSB", band),
                     ),
@@ -426,7 +442,7 @@ async fn handle_pota_impl(
     Ok(())
 }
 
-async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSource) -> Result<()> {
+async fn handle_pota(client: &mut SeabirdClient, arg: &str, command_source: ChannelSource) -> Result<()> {
     let parts: Vec<_> = arg.split_whitespace().collect();
     match parts.as_slice() {
         [band_str] => {
@@ -439,7 +455,7 @@ async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSour
                     client
                         .send_message(
                             command_source.channel_id.clone(),
-                            with_reply(&command_source, "invalid mode".to_string()),
+                            with_reply_block(&command_source, "invalid mode".to_string()),
                             /* tags = */ None,
                         )
                         .await?;
@@ -453,7 +469,7 @@ async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSour
             client
                 .send_message(
                     command_source.channel_id.clone(),
-                    with_reply(
+                    with_reply_block(
                         &command_source,
                         "invalid pota command. Usage: pota <band> [mode]".to_string(),
                     ),
@@ -466,13 +482,13 @@ async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSour
     Ok(())
 }
 
-async fn handle_qrz(client: &mut Client, arg: &str, command_source: ChannelSource) -> Result<()> {
+async fn handle_qrz(client: &mut SeabirdClient, arg: &str, command_source: ChannelSource) -> Result<()> {
     let callsign = arg;
     if callsign.contains(' ') {
         client
             .send_message(
                 command_source.channel_id.clone(),
-                with_reply(&command_source, "usage: qrz <callsign>".to_string()),
+                with_reply_block(&command_source, "usage: qrz <callsign>".to_string()),
                 /* tags = */ None,
             )
             .await?;
@@ -495,7 +511,7 @@ async fn handle_qrz(client: &mut Client, arg: &str, command_source: ChannelSourc
             client
                 .send_message(
                     command_source.channel_id.clone(),
-                    with_reply(&command_source, "QRZ lookup timed out".to_string()),
+                    with_reply_block(&command_source, "QRZ lookup timed out".to_string()),
                     /* tags = */ None,
                 )
                 .await?;
@@ -507,7 +523,7 @@ async fn handle_qrz(client: &mut Client, arg: &str, command_source: ChannelSourc
                 client
                     .send_message(
                         command_source.channel_id.clone(),
-                        with_reply(&command_source, format!("\"{callsign}\" not found")),
+                        with_reply_block(&command_source, format!("\"{callsign}\" not found")),
                         /* tags = */ None,
                     )
                     .await?;
@@ -517,7 +533,7 @@ async fn handle_qrz(client: &mut Client, arg: &str, command_source: ChannelSourc
                 client
                     .send_message(
                         command_source.channel_id.clone(),
-                        with_reply(
+                        with_reply_block(
                             &command_source,
                             "QRZ subscription is required but the plugin doesn't have it"
                                 .to_string(),
@@ -531,7 +547,7 @@ async fn handle_qrz(client: &mut Client, arg: &str, command_source: ChannelSourc
                 client
                     .send_message(
                         command_source.channel_id.clone(),
-                        with_reply(
+                        with_reply_block(
                             &command_source,
                             format!("error querying QRZ for callsign \"{callsign}\": {e:?}"),
                         ),
@@ -579,7 +595,7 @@ async fn handle_qrz(client: &mut Client, arg: &str, command_source: ChannelSourc
     client
         .send_message(
             command_source.channel_id.clone(),
-            with_reply(&command_source, reply),
+            with_reply_block(&command_source, reply),
             /* tags = */ None,
         )
         .await?;
@@ -632,7 +648,7 @@ async fn main() -> Result<()> {
     loop {
         info!("connecting with URL {}", url);
 
-        let mut client = match Client::new(ClientConfig {
+        let mut client = match SeabirdClient::new(ClientConfig {
             url: url.clone(),
             token: token.clone(),
         })
@@ -719,7 +735,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn process_event(client: &mut Client, event: seabird::proto::Event) -> Result<()> {
+async fn process_event(client: &mut SeabirdClient, event: seabird::proto::Event) -> Result<()> {
     if let Some(seabird::proto::event::Inner::Command(CommandEvent {
         source: Some(command_source),
         command,
@@ -733,7 +749,7 @@ async fn process_event(client: &mut Client, event: seabird::proto::Event) -> Res
             client
                 .send_message(
                     command_source.channel_id.clone(),
-                    with_reply(&command_source, format!("current band conditions:")),
+                    with_reply_block(&command_source, format!("current band conditions:")),
                     /* tags = */ None,
                 )
                 .await?;
@@ -742,7 +758,7 @@ async fn process_event(client: &mut Client, event: seabird::proto::Event) -> Res
                 client
                     .send_message(
                         command_source.channel_id.clone(),
-                        line,
+                        text_block(line),
                         /* tags = */ None,
                     )
                     .await?;
