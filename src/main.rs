@@ -126,8 +126,16 @@ fn format_solar_data(data: Solar) -> Result<Vec<String>> {
 }
 
 async fn fetch_solar_data() -> Result<Solar> {
+    // Disable connection pooling to avoid stale connections timing out
+    // (these requests are infrequent, so pooling provides no benefit)
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()?;
+
     let text = timeout(Duration::from_secs(10), async {
-        reqwest::get("https://www.hamqsl.com/solarxml.php")
+        client
+            .get("https://www.hamqsl.com/solarxml.php")
+            .send()
             .await?
             .text()
             .await
@@ -321,8 +329,15 @@ impl Band {
 }
 
 async fn fetch_activations() -> Result<Vec<Activation>> {
+    // Disable connection pooling to avoid stale connections timing out
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()?;
+
     let activations = timeout(Duration::from_secs(10), async {
-        reqwest::get("https://api.pota.app/v1/spots")
+        client
+            .get("https://api.pota.app/v1/spots")
+            .send()
             .await?
             .json::<Vec<ParsedActivation>>()
             .await
