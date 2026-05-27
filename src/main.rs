@@ -9,8 +9,8 @@ use chrono::Utc;
 use futures::StreamExt;
 use qrz_xml::QrzXmlError;
 use qrz_xml::{ApiVersion, QrzXmlClient};
-use seabird::Client;
 use seabird::ClientConfig;
+use seabird::SeabirdClient;
 use seabird::proto::ChannelSource;
 use seabird::proto::CommandEvent;
 use seabird::proto::CommandMetadata;
@@ -359,7 +359,7 @@ async fn most_recent_activation(band: &Band, mode: &Mode) -> Result<Option<Activ
 }
 
 async fn handle_pota_impl(
-    client: &mut Client,
+    client: &mut SeabirdClient,
     band_str: &str,
     mode: Mode,
     command_source: ChannelSource,
@@ -426,7 +426,7 @@ async fn handle_pota_impl(
     Ok(())
 }
 
-async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSource) -> Result<()> {
+async fn handle_pota(client: &mut SeabirdClient, arg: &str, command_source: ChannelSource) -> Result<()> {
     let parts: Vec<_> = arg.split_whitespace().collect();
     match parts.as_slice() {
         [band_str] => {
@@ -466,7 +466,7 @@ async fn handle_pota(client: &mut Client, arg: &str, command_source: ChannelSour
     Ok(())
 }
 
-async fn handle_qrz(client: &mut Client, arg: &str, command_source: ChannelSource) -> Result<()> {
+async fn handle_qrz(client: &mut SeabirdClient, arg: &str, command_source: ChannelSource) -> Result<()> {
     let callsign = arg;
     if callsign.contains(' ') {
         client
@@ -632,7 +632,7 @@ async fn main() -> Result<()> {
     loop {
         info!("connecting with URL {}", url);
 
-        let mut client = match Client::new(ClientConfig {
+        let mut client = match SeabirdClient::new(ClientConfig {
             url: url.clone(),
             token: token.clone(),
         })
@@ -719,7 +719,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn process_event(client: &mut Client, event: seabird::proto::Event) -> Result<()> {
+async fn process_event(client: &mut SeabirdClient, event: seabird::proto::Event) -> Result<()> {
     if let Some(seabird::proto::event::Inner::Command(CommandEvent {
         source: Some(command_source),
         command,
