@@ -1,3 +1,5 @@
+mod rbn;
+
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
@@ -9,6 +11,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use qrz_xml::QrzXmlError;
 use qrz_xml::{ApiVersion, QrzXmlClient};
+use rbn::RbnDb;
 use seabird::ClientConfig;
 use seabird::SeabirdClient;
 use seabird::proto::ChannelSource;
@@ -587,6 +590,61 @@ async fn handle_qrz(client: &mut SeabirdClient, arg: &str, command_source: Chann
     Ok(())
 }
 
+async fn handle_rbn(
+    client: &mut SeabirdClient,
+    db: &RbnDb,
+    arg: &str,
+    command_source: ChannelSource,
+) -> Result<()> {
+    let parts: Vec<_> = arg.split_whitespace().collect();
+    let channel_id = command_source.channel_id.clone();
+
+    let reply = match parts.as_slice() {
+        ["add", call] => {
+            let call = call.to_uppercase();
+            match db.add_monitored(&channel_id, &call) {
+                Ok(true) => format!("monitoring {call}"),
+                Ok(false) => format!("{call} is already monitored"),
+                Err(e) => format!("error adding {call}: {e}"),
+            }
+        }
+        ["remove", call] | ["rm", call] => {
+            let call = call.to_uppercase();
+            match db.remove_monitored(&channel_id, &call) {
+                Ok(true) => format!("stopped monitoring {call}"),
+                Ok(false) => format!("{call} was not monitored"),
+                Err(e) => format!("error removing {call}: {e}"),
+            }
+        }
+        ["list"] => match db.list_monitored(&channel_id) {
+            Ok(calls) if calls.is_empty() => "no callsigns monitored".to_string(),
+            Ok(calls) => format!("monitoring: {}", calls.join(", ")),
+            Err(e) => format!("error listing: {e}"),
+        },
+        [call] => {
+            let call = call.to_uppercase();
+            match rbn::lookup_latest_spot(&call).await {
+                Ok(Some(spot)) => format!(
+                    "{} last spotted at {} kHz {} ({})",
+                    spot.callsign, spot.frequency, spot.mode, spot.timestamp
+                ),
+                Ok(None) => format!("no recent spots for {call}"),
+                Err(e) => format!("lookup error: {e}"),
+            }
+        }
+        _ => "usage: rbn add <call> | rbn remove <call> | rbn list | rbn <call>".to_string(),
+    };
+
+    client
+        .send_message(
+            channel_id,
+            with_reply(&command_source, reply),
+            /* tags = */ None,
+        )
+        .await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
@@ -596,8 +654,25 @@ async fn main() -> Result<()> {
     env::var("QRZ_PASSWORD")
         .map_err(|_| anyhow!("must specify QRZ_PASSWORD environment variable"))?;
 
+    let rbn_callsign = env::var("RBN_CALLSIGN")
+        .map_err(|_| anyhow!("must specify RBN_CALLSIGN environment variable"))?;
+    let rbn_db_path =
+        env::var("RBN_DB_PATH").unwrap_or_else(|_| rbn::DEFAULT_DB_PATH.to_string());
+
     let url = env::var("SEABIRD_URL").unwrap_or_else(|_| "https://api.seabird.chat".to_string());
     let token = env::var("SEABIRD_TOKEN")?;
+
+    let rbn_db = RbnDb::open(&rbn_db_path)?;
+    info!("RBN db opened at {}", rbn_db_path);
+
+    let (outbound_tx, mut outbound_rx) =
+        tokio::sync::mpsc::unbounded_channel::<rbn::OutboundMessage>();
+    rbn::spawn_connections(
+        rbn::default_servers(),
+        rbn_callsign,
+        rbn_db.clone(),
+        outbound_tx,
+    );
 
     let commands = HashMap::from_iter([
         (
@@ -621,6 +696,14 @@ async fn main() -> Result<()> {
                 name: "qrz".to_string(),
                 short_help: "HAM radio callsign lookup".to_string(),
                 full_help: "Lookup a HAM radio callsign using QRZ's API".to_string(),
+            },
+        ),
+        (
+            "rbn".to_string(),
+            CommandMetadata {
+                name: "rbn".to_string(),
+                short_help: "RBN spot monitor".to_string(),
+                full_help: "Monitor amateur callsigns on the Reverse Beacon Network. Usage: rbn add <call> | rbn remove <call> | rbn list | rbn <call>".to_string(),
             },
         ),
     ]);
@@ -670,35 +753,45 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Event processing loop with timeout to detect broken streams
-        let stream_result = loop {
-            // Use a 2-minute timeout for each event. If no events arrive in 2 minutes,
-            // the stream is likely broken and we should reconnect.
-            let event_result = timeout(Duration::from_secs(120), stream.next()).await;
+        // Event processing loop with idle-watchdog to detect broken streams.
+        let mut last_event = tokio::time::Instant::now();
+        let mut watchdog = tokio::time::interval(Duration::from_secs(30));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            match event_result {
-                Err(_) => {
-                    // Timeout - stream appears to be stuck
-                    error!(
-                        "event stream timeout (no events for 120 seconds) - stream likely broken"
-                    );
-                    break Err(anyhow!("stream timeout"));
+        let stream_result: Result<()> = loop {
+            tokio::select! {
+                next = stream.next() => {
+                    last_event = tokio::time::Instant::now();
+                    match next {
+                        None => {
+                            warn!("event stream ended");
+                            break Ok(());
+                        }
+                        Some(Err(e)) => {
+                            error!("event stream error: {}", e);
+                            break Err(e.into());
+                        }
+                        Some(Ok(event)) => {
+                            if let Err(e) = process_event(&mut client, &rbn_db, event).await {
+                                error!("error processing event: {}", e);
+                            }
+                        }
+                    }
                 }
-                Ok(None) => {
-                    // Stream ended normally
-                    warn!("event stream ended");
-                    break Ok(());
+                Some(msg) = outbound_rx.recv() => {
+                    if let Err(e) = client
+                        .send_message(msg.channel_id, msg.text, /* tags = */ None)
+                        .await
+                    {
+                        error!("failed to send RBN alert: {}", e);
+                    }
                 }
-                Ok(Some(Err(e))) => {
-                    // Stream error
-                    error!("event stream error: {}", e);
-                    break Err(e.into());
-                }
-                Ok(Some(Ok(event))) => {
-                    // Process the event
-                    if let Err(e) = process_event(&mut client, event).await {
-                        error!("error processing event: {}", e);
-                        // Continue processing other events despite errors
+                _ = watchdog.tick() => {
+                    if last_event.elapsed() > Duration::from_secs(120) {
+                        error!(
+                            "event stream timeout (no events for 120 seconds) - stream likely broken"
+                        );
+                        break Err(anyhow!("stream timeout"));
                     }
                 }
             }
@@ -719,7 +812,11 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn process_event(client: &mut SeabirdClient, event: seabird::proto::Event) -> Result<()> {
+async fn process_event(
+    client: &mut SeabirdClient,
+    rbn_db: &RbnDb,
+    event: seabird::proto::Event,
+) -> Result<()> {
     if let Some(seabird::proto::event::Inner::Command(CommandEvent {
         source: Some(command_source),
         command,
@@ -753,6 +850,9 @@ async fn process_event(client: &mut SeabirdClient, event: seabird::proto::Event)
         } else if command == "qrz" {
             info!("[cmd:qrz] {}", arg);
             handle_qrz(client, &arg, command_source).await?;
+        } else if command == "rbn" {
+            info!("[cmd:rbn] {}", arg);
+            handle_rbn(client, rbn_db, &arg, command_source).await?;
         }
     }
 

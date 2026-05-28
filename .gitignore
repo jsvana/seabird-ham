@@ -1,3 +1,7 @@
 /target
 .env
 .claude/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
