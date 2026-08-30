@@ -1,0 +1,85 @@
+name: Build main
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-main
+  cancel-in-progress: true
+
+jobs:
+  build-and-publish-latest:
+    name: Build and publish latest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-gnu/release/seabird-ham
+
+      - name: Create tarball
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          tar -czf seabird-ham-latest-x86_64-linux.tar.gz seabird-ham
+          mv seabird-ham-latest-x86_64-linux.tar.gz ../../../
+
+      - name: Generate checksums
+        run: |
+          sha256sum seabird-ham-latest-x86_64-linux.tar.gz > seabird-ham-latest-x86_64-linux.tar.gz.sha256
+
+      - name: Update latest tag
+        run: |
+          git tag -f latest
+          git push -f origin latest
+
+      - name: Publish rolling latest release
+        run: |
+          if ! gh release view latest > /dev/null 2>&1; then
+            gh release create latest \
+              --prerelease \
+              --title "latest (main)" \
+              --notes "Rolling build of main."
+          fi
+          gh release upload latest --clobber \
+            seabird-ham-latest-x86_64-linux.tar.gz \
+            seabird-ham-latest-x86_64-linux.tar.gz.sha256
+          gh release edit latest \
+            --notes "Rolling build of main. Commit: ${GITHUB_SHA}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
